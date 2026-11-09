@@ -3,6 +3,8 @@
 Keys in the video window:  q = quit,  d = toggle detection,  s = save snapshot
 """
 import collections
+import csv
+import os
 import struct
 import sys
 import threading
@@ -17,11 +19,28 @@ SERIAL_PORT = "COM11"
 BAUD_RATE = 921600
 SNAPSHOT_DIR = r"C:\Users\jackk\Desktop\SeniorProject"
 
+def save_snapshot(img):
+    """Save the annotated view as a PNG. Falls back to the script folder if SNAPSHOT_DIR is unusable."""
+    name = f"snapshot_{time.strftime('%Y%m%d_%H%M%S')}.png"
+    for folder in (SNAPSHOT_DIR, os.path.dirname(os.path.abspath(__file__)), os.getcwd()):
+        try:
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, name)
+            if cv2.imwrite(path, img):
+                print("Saved snapshot:", path)
+                return path
+        except Exception as e:
+            print(f"Could not save to {folder}: {e}")
+    print("Snapshot FAILED in every folder tried.")
+    return None
+
+
 POLARITY_COMBO = 4      # 4 = VS low, HS low, PCLK rising (validated on your hardware)
 CLKRC = 0x03            # sensor clock divider: 0x00 = fastest. DMA stalled at 0x00 on this board, so start at 0x03
                         # (polling mode ignores anything faster than 0x07)
 DVP_DIV = 0x08          # pixel-clock divider (reg 0xD3); lower = faster, ST default 0x08
 
+LOG_CSV = True          # write one row per frame (timings + scores) to stream_log_<time>.csv in SNAPSHOT_DIR
 PC_DETECTOR = False     # True = also run a PC-side person detector (boxes) for comparison with the board
 PRESENCE_THRESHOLD = 60 # smoothed person score (0-100) at/above which someone counts as present
 SMOOTH_N = 3            # number of recent frames averaged for the presence decision
@@ -31,7 +50,7 @@ MIN_SCORE = 0.3         # HOG weight threshold
 DISPLAY_SCALE = 2
 
 # ----------------------------------------------------------------------------- protocol
-HEADER = struct.Struct("<4sIHHBBIBBH")  # magic, counter, w, h, format, flags, length, person%, notperson%, infer_ms (22 bytes)
+HEADER = struct.Struct("<4sIHHBBIBBHHHH")  # magic, counter, w, h, format, flags, length, person%, notperson%, infer_ms, cap_ms, prep_ms, send_ms (28 bytes)
 MAGIC = b"FRMX"
 
 
@@ -57,7 +76,8 @@ class FrameParser:
                 del self.buf[:i]
             if len(self.buf) < HEADER.size:
                 break
-            _, counter, w, h, fmt, flags, length, p_person, p_notp, infer_ms = HEADER.unpack_from(self.buf)
+            (_, counter, w, h, fmt, flags, length, p_person, p_notp, infer_ms,
+             cap_ms, prep_ms, send_ms) = HEADER.unpack_from(self.buf)
             valid = (0 < w <= 1024 and 0 < h <= 1024 and fmt in (0, 1)
                      and length == w * h * (1 if fmt == 0 else 2))
             if not valid:                           # false magic inside pixel data: skip a byte
@@ -68,7 +88,8 @@ class FrameParser:
                 break
             payload = bytes(self.buf[HEADER.size:HEADER.size + length])
             del self.buf[:HEADER.size + length]
-            frames.append((counter, w, h, fmt, flags, payload, p_person, p_notp, infer_ms))
+            frames.append((counter, w, h, fmt, flags, payload, p_person, p_notp, infer_ms,
+                           cap_ms, prep_ms, send_ms))
         return frames
 
 
@@ -211,6 +232,21 @@ def main():
     shown = 0
     t_start = time.time()
     last_log = t_start
+    last_frame_t = None
+    last_logged = None
+    last_view = None
+    smooth = 0.0
+    stats = {k: [] for k in ('cap', 'prep', 'infer', 'send', 'period')}
+    log_file, log_writer = None, None
+    if LOG_CSV:
+        try:
+            os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+            log_file = open(os.path.join(SNAPSHOT_DIR, f"stream_log_{int(t_start)}.csv"), "w", newline="")
+            log_writer = csv.writer(log_file)
+            log_writer.writerow(["t_s", "frame", "person_pct", "notperson_pct", "smoothed", "present", "model_ok",
+                                 "cap_ms", "prep_ms", "infer_ms", "send_ms", "host_period_ms", "mean_brightness", "overrun"])
+        except Exception as e:
+            print(f"CSV logging disabled ({e})")
 
     print("Streaming. Keys: q = quit, d = toggle detection, s = save snapshot")
     while True:
@@ -219,11 +255,19 @@ def main():
             if time.time() - t_start > 15 and receiver.received == 0:
                 print("No frames after 15 s. Check the board info line above (dma/timeouts) and wiring.")
                 break
-            if cv2.waitKey(5) & 0xFF == ord("q"):
+            key = cv2.waitKey(5) & 0xFF
+            if key == ord("q"):
                 break
+            if key == ord("s") and last_view is not None:
+                save_snapshot(last_view)
+            if key == ord("d") and detect is not None:
+                detecting = not detecting
             continue
 
-        counter, w, h, fmt, flags, payload, p_person, p_notp, infer_ms = frame
+        counter, w, h, fmt, flags, payload, p_person, p_notp, infer_ms, cap_ms, prep_ms, send_ms = frame
+        now = time.time()
+        host_dt = (now - last_frame_t) if last_frame_t else 0.0
+        last_frame_t = now
         last_counter = counter
         gray, bgr = to_images(w, h, fmt, payload)
 
@@ -241,7 +285,8 @@ def main():
             fps_n, fps_t0 = 0, time.time()
 
         if time.time() - last_log >= 5:
-            print(f"[{time.time() - t_start:5.0f}s] {fps:.2f} fps | frame #{counter} | mean {gray.mean():.0f}")
+            print(f"[{time.time() - t_start:5.0f}s] {fps:.2f} fps | frame #{counter} | mean {gray.mean():.0f} | "
+                  f"board ms: cap {cap_ms} prep {prep_ms} infer {infer_ms} send {send_ms}")
             last_log = time.time()
 
         view = cv2.resize(bgr, (w * DISPLAY_SCALE, h * DISPLAY_SCALE), interpolation=cv2.INTER_NEAREST)
@@ -282,6 +327,18 @@ def main():
         inset = cv2.cvtColor(cv2.resize(inset, (192, 192), interpolation=cv2.INTER_NEAREST), cv2.COLOR_GRAY2BGR)
         if view.shape[0] > 220 and view.shape[1] > 220:
             view[28:28 + 192, view.shape[1] - 202:view.shape[1] - 10] = inset
+        if counter > 1 and host_dt > 0 and counter != last_logged:
+            stats["cap"].append(cap_ms); stats["prep"].append(prep_ms)
+            stats["infer"].append(infer_ms); stats["send"].append(send_ms); stats["period"].append(host_dt * 1000)
+        if log_writer is not None and counter != last_logged:
+            log_writer.writerow([f"{now - t_start:.2f}", counter, p_person, p_notp,
+                                 f"{smooth:.1f}" if model_ok else "", int(bool(present)) if model_ok else "",
+                                 int(model_ok), cap_ms, prep_ms, infer_ms, send_ms, f"{host_dt * 1000:.0f}",
+                                 f"{gray.mean():.0f}", flags & 1])
+            if counter % 20 == 0:
+                log_file.flush()
+        last_logged = counter
+        last_view = view.copy()
         cv2.imshow("Portenta OV2640 stream", view)
 
         key = cv2.waitKey(1) & 0xFF
@@ -290,9 +347,7 @@ def main():
         if key == ord("d") and detect is not None:
             detecting = not detecting
         if key == ord("s"):
-            path = f"{SNAPSHOT_DIR}\\snapshot_{int(time.time())}.png"
-            cv2.imwrite(path, view)
-            print("Saved", path)
+            save_snapshot(last_view)
 
     receiver.running = False
     receiver.join(timeout=1.0)
@@ -309,6 +364,16 @@ def main():
           tail[k:].split(b"\n")[0].decode(errors="replace").strip() if k >= 0 else "(no reply)")
     ser.close()
     cv2.destroyAllWindows()
+    def _summ(name, vals):
+        if vals:
+            print(f"  {name:<14} mean {sum(vals) / len(vals):7.1f} ms | max {max(vals):6.0f} | min {min(vals):6.0f}")
+    print("Timing summary (per frame):")
+    _summ("board capture", stats["cap"]); _summ("board prep", stats["prep"])
+    _summ("board infer", stats["infer"]); _summ("board send", stats["send"])
+    _summ("frame period", stats["period"])
+    if log_file is not None:
+        log_file.close()
+        print("Per-frame log saved:", log_file.name)
     print(f"Done. Frames received: {receiver.received}, overruns flagged: {receiver.overruns}, "
           f"bytes skipped while resyncing: {receiver.parser.skipped}")
 
