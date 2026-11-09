@@ -62,3 +62,101 @@
 | Neural Network     | Learning Rate      | 0.005            |
 | Neural Network     | Batch Size         | 32 or 64         |
 | Deployment         | Model Optimization | int8 Quantized   |
+## Project Structure
+```mermaid
+flowchart LR
+
+  
+
+subgraph MCU["Portenta H7 (STM32H747)"]
+
+    direction TB
+
+        subgraph I2C1
+
+            M_SCCB["Wire1 (I2C) master"]
+
+        end
+
+        subgraph DCMI["Digital Camera Interface"]
+
+            M_SYNC["DCMI HSYNC: HS<br/>DCMI VSYNC: CKP"]
+
+            M_DAT["DCMI data: D0P,D0N...D3P,D3N"]
+
+            M_CLK["DCMI PIXCLK: CKN"]
+
+        end
+
+    subgraph I2S
+
+        I2S_WS["WS (Word Select)"]
+
+        I2S_SDI["SDI (Serial Data Input)"]
+
+        I2S_CK["CK (Serial Clock)"]
+
+    end
+
+  
+
+    M_USB["USB serial"]
+
+  end
+
+  
+
+subgraph OV2640["OV2640 camera"]
+
+    C_SCCB["SDA / SCL"]
+
+    C_DAT["D0-D7"]
+
+    C_CLK["PCLK"]
+
+    C_SYNC["HREF / VSYNC"]
+
+  end
+
+  
+
+  subgraph PC["PC (Python scripts)"]
+
+    P_COM["COM port"]
+
+  end
+
+  
+
+  subgraph INMP441["INMP441 Mic"]
+
+    SCK["SCK (Serial Clock)"]
+
+    WS["WS (Word Select)"]
+
+    SD["SD (Serial Data)"]
+
+  end
+
+  
+
+  M_SCCB -->|"SCCB (commands), write config"| C_SCCB
+
+  C_SCCB --> |"read chip ID" |M_SCCB
+
+  C_DAT -->|"8-bit YUV422 pixel bytes"| M_DAT
+
+  C_CLK -->|"pixel clock"| M_CLK
+
+  C_SYNC -->|"line and frame sync"| M_SYNC
+
+  M_USB -->|"FRMX header + 320x240 frame + audio"| P_COM
+
+  P_COM -->|"ASCII commands"| M_USB
+
+  I2S_CK -->|"Clock Signal"| SCK
+
+  I2S_WS -->|"L/R channel selection (Low for L)"| WS
+
+  SD -->|"Serial Data"| I2S_SDI
+```
